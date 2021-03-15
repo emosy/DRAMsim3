@@ -26,7 +26,12 @@ Controller::Controller(int channel, const Config &config, const Timing &timing)
                           ? RowBufPolicy::CLOSE_PAGE
                           : RowBufPolicy::OPEN_PAGE),
       last_trans_clk_(0),
-      write_draining_(0) {
+      write_draining_(false),
+      force_reads_(false)
+#ifdef BLOOD_GRAPH
+      ,blood_graph_(channel, config)
+#endif
+{
     if (is_unified_queue_) {
         unified_queue_.reserve(config_.trans_queue_size);
     } else {
@@ -219,17 +224,17 @@ bool Controller::AddTransaction(Transaction trans) {
 
 void Controller::ScheduleTransaction() {
     // determine whether to schedule read or write
-    if (write_draining_ == 0 && !is_unified_queue_) {
+    if (!write_draining_ && !is_unified_queue_ && !force_reads_) {
         // we basically have a upper and lower threshold for write buffer
         if ((write_buffer_.size() >= write_buffer_.capacity()) ||
             (write_buffer_.size() > 8 && cmd_queue_.QueueEmpty())) {
-            write_draining_ = write_buffer_.size();
+            write_draining_ = true;
         }
     }
 
     std::vector<Transaction> &queue =
         is_unified_queue_ ? unified_queue_
-                          : write_draining_ > 0 ? write_buffer_ : read_queue_;
+                          : write_draining_ ? write_buffer_ : read_queue_;
     for (auto it = queue.begin(); it != queue.end(); it++) {
         auto cmd = TransToCommand(*it);
         if (cmd_queue_.WillAcceptCommand(cmd.Rank(), cmd.Bankgroup(),
@@ -237,10 +242,11 @@ void Controller::ScheduleTransaction() {
             if (!is_unified_queue_ && cmd.IsWrite()) {
                 // Enforce R->W dependency
                 if (pending_rd_q_.count(it->addr) > 0) {
-                    write_draining_ = 0;
-                    break;
+                    write_draining_ = false;
+                    force_reads_ = true;
+                    return;
                 }
-                write_draining_ -= 1;
+                //write_draining_ -= 1;
             }
             cmd_queue_.AddCommand(cmd);
             queue.erase(it);
@@ -282,6 +288,9 @@ void Controller::IssueCommand(const Command &cmd) {
         auto wr_lat = clk_ - it->second.added_cycle + config_.write_delay;
         simple_stats_.AddValue("write_latency", wr_lat);
         pending_wr_q_.erase(it);
+        if (pending_wr_q_.size() == 0) {
+          write_draining_ = false;
+        }
     }
     // must update stats before states (for row hits)
     UpdateCommandStats(cmd);
